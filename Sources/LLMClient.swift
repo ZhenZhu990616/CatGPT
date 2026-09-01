@@ -17,7 +17,7 @@ actor LLMClient {
     private let session: URLSession
     private let onCredentialsRefreshed: @Sendable (CodexOAuthCredentials) -> Void
     private let refreshCredentialsProvider: @Sendable (CodexOAuthCredentials) async throws -> CodexOAuthCredentials
-    private var credentials: CodexOAuthCredentials
+    private var credentials: CodexOAuthCredentials?
     private var refreshTask: Task<CodexOAuthCredentials, Error>?
 
     /// 内部信号：access token 被服务端拒绝（HTTP 401），可刷新后重试一次。
@@ -42,8 +42,11 @@ actor LLMClient {
     /// 一旦请求到达服务端完成轮换，本地就必须拿到并保存新 token——
     /// 用 detached task 执行并在任务内部完成持久化，即使调用方被取消也不丢结果。
     private func refreshCredentials(force: Bool = false) async throws -> CodexOAuthCredentials {
-        if !force, !credentials.needsRefresh {
-            return credentials
+        guard let currentCredentials = credentials else {
+            throw AppError.configuration("请先登录 ChatGPT/Codex。")
+        }
+        if !force, !currentCredentials.needsRefresh {
+            return currentCredentials
         }
         if let task = refreshTask {
             let refreshed = try await task.value
@@ -51,7 +54,7 @@ actor LLMClient {
             return refreshed
         }
 
-        let current = credentials
+        let current = currentCredentials
         let callback = onCredentialsRefreshed
         let provider = self.refreshCredentialsProvider
         let task = Task.detached {
@@ -82,10 +85,72 @@ actor LLMClient {
         guard !imageDataList.isEmpty else {
             throw AppError.configuration("至少需要一张截图。")
         }
-        return try await perform(
-            body: Self.makeRequestBody(config: config, imageDataList: imageDataList, mimeType: mimeType),
-            onEvent: onEvent
-        )
+        let body: [String: Any]
+        switch config.provider {
+        case .codex:
+            body = Self.makeRequestBody(config: config, imageDataList: imageDataList, mimeType: mimeType)
+        case .openAICompatible:
+            body = Self.makeOpenAICompatibleRequestBody(config: config, imageDataList: imageDataList, mimeType: mimeType)
+        }
+        return try await perform(body: body, onEvent: onEvent)
+    }
+
+    /// 向 OpenAI 兼容服务发送一次最小非流式请求，用于验证地址、凭证和模型是否可用。
+    func verifyConnection() async throws {
+        guard config.provider == .openAICompatible else {
+            throw AppError.configuration("当前不是 OpenAI 兼容 API。")
+        }
+
+        let body = Self.makeOpenAICompatibleVerificationRequestBody(config: config)
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        guard let url = Self.resolveOpenAICompatibleEndpoint(config.customBaseURL) else {
+            throw AppError.configuration("OpenAI 兼容 API 地址无效。")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if !config.customAPIKey.isEmpty {
+            request.setValue("Bearer \(config.customAPIKey)", forHTTPHeaderField: "Authorization")
+        }
+        request.timeoutInterval = 30
+        request.httpBody = bodyData
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await withTimeout(
+                seconds: 30,
+                timeoutMessage: "外部 LLM 验证超过 30 秒仍未返回。"
+            ) {
+                try await self.session.data(for: request)
+            }
+        } catch {
+            if Self.isCancellationError(error) { throw error }
+            if error is AppError { throw error }
+            throw AppError.network(Self.openAICompatibleNetworkErrorMessage(error))
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AppError.network("外部 LLM 返回了无效的 HTTP 响应。")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let message = Self.openAICompatibleErrorMessage(from: data)
+                ?? "外部 LLM 请求失败：HTTP \(http.statusCode)。"
+            throw AppError.response(message)
+        }
+
+        do {
+            if Self.looksLikeOpenAICompatibleSSE(data) {
+                _ = try Self.parseOpenAICompatibleSSE(from: data, onEvent: nil)
+            } else {
+                _ = try Self.parseOpenAICompatibleContent(from: data)
+            }
+        } catch let error as AppError {
+            throw error
+        } catch {
+            throw AppError.response("外部 LLM 返回格式无法识别，请确认接口返回 OpenAI 兼容格式。")
+        }
     }
 
     nonisolated static func makeRequestBody(
@@ -101,6 +166,50 @@ actor LLMClient {
             ]
         })
         return makeBody(config: config, input: [["role": "user", "content": content]])
+    }
+
+    nonisolated static func makeOpenAICompatibleRequestBody(
+        config: AppConfig,
+        imageDataList: [Data],
+        mimeType: String
+    ) -> [String: Any] {
+        var content: [[String: Any]] = [["type": "text", "text": config.prompt]]
+        content.append(contentsOf: imageDataList.map { imageData in
+            [
+                "type": "image_url",
+                "image_url": ["url": "data:\(mimeType);base64,\(imageData.base64EncodedString())"]
+            ]
+        })
+
+        var body: [String: Any] = [
+            "model": config.model,
+            // Non-streaming is the most widely supported mode across third-party
+            // vision gateways. The response reader still accepts SSE if a gateway
+            // ignores this flag and streams anyway.
+            "stream": false,
+            "messages": [
+                ["role": "system", "content": config.instructions],
+                ["role": "user", "content": content]
+            ]
+        ]
+        if config.maxOutputTokens > 0 {
+            body["max_tokens"] = config.maxOutputTokens
+        }
+        return body
+    }
+
+    nonisolated static func makeOpenAICompatibleVerificationRequestBody(config: AppConfig) -> [String: Any] {
+        [
+            "model": config.model,
+            "stream": false,
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Reply with OK."
+                ]
+            ],
+            "max_tokens": 1
+        ]
     }
 
     nonisolated private static func makeBody(config: AppConfig, input: [[String: Any]]) -> [String: Any] {
@@ -134,21 +243,66 @@ actor LLMClient {
         body: [String: Any],
         onEvent: (@Sendable (LLMStreamEvent) -> Void)?
     ) async throws -> String {
-        let activeCredentials = try await refreshCredentials()
         let timeoutSeconds = responseTimeoutSeconds
         let bodyData = try JSONSerialization.data(withJSONObject: body)
 
-        do {
-            return try await send(bodyData: bodyData, credentials: activeCredentials, timeoutSeconds: timeoutSeconds, onEvent: onEvent)
-        } catch is UnauthorizedError {
-            // access token 被服务端提前吊销：强制刷新一次并重试。
-            let refreshed = try await refreshCredentials(force: true)
+        switch config.provider {
+        case .openAICompatible:
+            return try await sendOpenAICompatible(bodyData: bodyData, timeoutSeconds: timeoutSeconds, onEvent: onEvent)
+        case .codex:
+            let activeCredentials = try await refreshCredentials()
             do {
-                return try await send(bodyData: bodyData, credentials: refreshed, timeoutSeconds: timeoutSeconds, onEvent: onEvent)
+                return try await send(bodyData: bodyData, credentials: activeCredentials, timeoutSeconds: timeoutSeconds, onEvent: onEvent)
             } catch is UnauthorizedError {
-                throw AppError.authExpired("ChatGPT 登录已失效，请重新登录。")
+                // access token 被服务端提前吊销：强制刷新一次并重试。
+                let refreshed = try await refreshCredentials(force: true)
+                do {
+                    return try await send(bodyData: bodyData, credentials: refreshed, timeoutSeconds: timeoutSeconds, onEvent: onEvent)
+                } catch is UnauthorizedError {
+                    throw AppError.authExpired("ChatGPT 登录已失效，请重新登录。")
+                }
             }
         }
+    }
+
+    private func sendOpenAICompatible(
+        bodyData: Data,
+        timeoutSeconds: UInt64,
+        onEvent: (@Sendable (LLMStreamEvent) -> Void)? = nil
+    ) async throws -> String {
+        guard let url = Self.resolveOpenAICompatibleEndpoint(config.customBaseURL) else {
+            throw AppError.configuration("OpenAI 兼容 API 地址无效。")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        if !config.customAPIKey.isEmpty {
+            request.setValue("Bearer \(config.customAPIKey)", forHTTPHeaderField: "Authorization")
+        }
+        request.timeoutInterval = TimeInterval(timeoutSeconds)
+        request.httpBody = bodyData
+
+        return try await withTimeout(seconds: timeoutSeconds) {
+            try await self.streamOpenAICompatibleResponse(for: request, onEvent: onEvent)
+        }
+    }
+
+    nonisolated static func resolveOpenAICompatibleEndpoint(_ base: String) -> URL? {
+        var value = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        while value.hasSuffix("/") { value.removeLast() }
+        if !value.hasSuffix("/chat/completions") {
+            value += "/chat/completions"
+        }
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            return nil
+        }
+        return url
     }
 
     private func send(
@@ -330,10 +484,256 @@ actor LLMClient {
         return result
     }
 
+    private func streamOpenAICompatibleResponse(
+        for request: URLRequest,
+        onEvent: (@Sendable (LLMStreamEvent) -> Void)?
+    ) async throws -> String {
+        let (data, response): (Data, URLResponse)
+        do {
+            // Some OpenAI-compatible gateways label ordinary JSON as SSE, and some
+            // return SSE framing that URLSession.AsyncBytes cannot parse reliably.
+            // Read the complete response first, then choose the parser from the body.
+            (data, response) = try await session.data(for: request)
+        } catch {
+            if Self.isCancellationError(error) { throw error }
+            throw AppError.network(Self.openAICompatibleNetworkErrorMessage(error))
+        }
+
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let message = Self.openAICompatibleErrorMessage(from: data)
+                ?? "外部 LLM 请求失败：HTTP \(http.statusCode)。"
+            throw AppError.response(message)
+        }
+
+        onEvent?(.connected)
+        // The body is authoritative here. Some gateways advertise SSE even when
+        // they return one complete JSON response for a streaming request.
+        if Self.looksLikeOpenAICompatibleSSE(data) {
+            let text = try Self.parseOpenAICompatibleSSE(from: data, onEvent: onEvent)
+            return text
+        }
+
+        let text = try Self.parseOpenAICompatibleContent(from: data)
+        onEvent?(.delta(text))
+        return text
+    }
+
+    private static func looksLikeOpenAICompatibleSSE(_ data: Data) -> Bool {
+        guard let text = String(data: data, encoding: .utf8) else { return false }
+        return text
+            .split(whereSeparator: \.isNewline)
+            .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("data:") }
+    }
+
+    private static func parseOpenAICompatibleSSE(
+        from data: Data,
+        onEvent: (@Sendable (LLMStreamEvent) -> Void)?
+    ) throws -> String {
+        guard let rawText = String(data: data, encoding: .utf8) else {
+            throw AppError.response("外部 LLM 返回格式无法识别，请确认接口返回 UTF-8 编码的 JSON 或 SSE。")
+        }
+
+        var deltaText = ""
+        var finalText = ""
+        var sawReasoning = false
+
+        for rawLine in rawText.split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline }) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("data:") else { continue }
+            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !payload.isEmpty, payload != "[DONE]" else { continue }
+            guard let jsonData = payload.data(using: String.Encoding.utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                continue
+            }
+
+            if let message = openAICompatibleErrorMessage(fromJSON: json) {
+                throw AppError.response(message)
+            }
+            guard let choice = (json["choices"] as? [[String: Any]])?.first else { continue }
+            let delta = choice["delta"] as? [String: Any]
+            let reasoning: String?
+            if let delta {
+                reasoning = delta["reasoning_content"] as? String ?? delta["reasoning"] as? String
+            } else {
+                reasoning = nil
+            }
+            if !sawReasoning, reasoning?.isEmpty == false {
+                sawReasoning = true
+                onEvent?(.reasoning)
+            }
+            if let delta {
+                let text = extractTextValue(from: delta["content"])
+                if !text.isEmpty {
+                    deltaText += text
+                    onEvent?(.delta(deltaText))
+                }
+            }
+            if let message = choice["message"] as? [String: Any] {
+                let text = extractTextValue(from: message["content"])
+                if !text.isEmpty {
+                    finalText = text
+                }
+            }
+            if let text = choice["text"] as? String {
+                deltaText += text
+                onEvent?(.delta(deltaText))
+            }
+        }
+
+        let result = (finalText.isEmpty ? deltaText : finalText)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty else {
+            throw AppError.response("外部 LLM 返回中没有可显示文本，请确认该模型支持当前请求。")
+        }
+        return stripReasoning(result)
+    }
+
+    private static func parseOpenAICompatibleContent(from data: Data) throws -> String {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            throw AppError.response("外部 LLM 返回格式无法识别：响应不是有效 JSON。")
+        }
+        if let jsonObject = json as? [String: Any],
+           let message = openAICompatibleErrorMessage(fromJSON: jsonObject) {
+            throw AppError.response(message)
+        }
+        let text = stripReasoning(extractOpenAICompatibleText(from: json))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            let preview = responsePreview(data)
+            let suffix = preview.map { " 响应摘要：\($0)" } ?? ""
+            throw AppError.response("外部 LLM 返回格式无法识别：未找到可显示文本。\(suffix)")
+        }
+        return text
+    }
+
+    private static func extractOpenAICompatibleText(from value: Any) -> String {
+        guard let dictionary = value as? [String: Any] else {
+            if let array = value as? [Any] {
+                return array.lazy
+                    .map(extractOpenAICompatibleText(from:))
+                    .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? ""
+            }
+            return value as? String ?? ""
+        }
+
+        if let choices = dictionary["choices"] as? [Any] {
+            for choice in choices {
+                let text = extractOpenAICompatibleChoiceText(from: choice)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return text
+                }
+            }
+        }
+
+        for key in ["output_text", "text", "content"] {
+            let text = extractTextValue(from: dictionary[key])
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return text
+            }
+        }
+
+        for key in ["data", "response", "output", "result", "message"] {
+            if let child = dictionary[key] {
+                let text = extractOpenAICompatibleText(from: child)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return text
+                }
+            }
+        }
+        return ""
+    }
+
+    private static func extractOpenAICompatibleChoiceText(from value: Any) -> String {
+        guard let choice = value as? [String: Any] else {
+            return extractOpenAICompatibleText(from: value)
+        }
+        for key in ["message", "delta"] {
+            if let child = choice[key] {
+                let text = extractTextValue(from: child)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return text
+                }
+            }
+        }
+        for key in ["text", "content"] {
+            let text = extractTextValue(from: choice[key])
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return text
+            }
+        }
+        return ""
+    }
+
+    private static func extractTextValue(from value: Any?) -> String {
+        guard let value else { return "" }
+        if let text = value as? String { return text }
+        if let array = value as? [Any] {
+            return array.map { extractTextValue(from: $0) }.joined()
+        }
+        guard let dictionary = value as? [String: Any] else { return "" }
+        for key in ["text", "content", "output_text", "value"] {
+            if let child = dictionary[key] {
+                let text = extractTextValue(from: child)
+                if !text.isEmpty { return text }
+            }
+        }
+        return ""
+    }
+
+    private static func responsePreview(_ data: Data) -> String? {
+        guard let raw = String(data: data, encoding: .utf8) else { return nil }
+        let compact = raw
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compact.isEmpty else { return nil }
+        let limit = 180
+        return compact.count > limit ? String(compact.prefix(limit)) + "…" : compact
+    }
+
     private static func isCancellationError(_ error: Error) -> Bool {
         if error is CancellationError { return true }
         let nsError = error as NSError
         return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
+    private static func openAICompatibleErrorMessage(from data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text?.isEmpty == false ? "外部 LLM 返回错误：\(text!)" : nil
+        }
+        return openAICompatibleErrorMessage(fromJSON: json)
+    }
+
+    private static func openAICompatibleErrorMessage(fromJSON json: [String: Any]) -> String? {
+        let error = json["error"] as? [String: Any]
+        let message = error?["message"] as? String
+            ?? json["message"] as? String
+            ?? json["detail"] as? String
+        guard let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return "外部 LLM 返回错误：\(message)"
+    }
+
+    private static func openAICompatibleNetworkErrorMessage(_ error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain,
+           nsError.code == URLError.Code.cannotParseResponse.rawValue {
+            return "外部 LLM 返回格式不正确，请确认 API 地址指向 OpenAI 兼容的 /chat/completions 接口。"
+        }
+        return error.localizedDescription
+    }
+
+    private static func stripReasoning(_ text: String) -> String {
+        var result = text
+        while let start = result.range(of: "<think>", options: .caseInsensitive),
+              let end = result.range(of: "</think>", options: .caseInsensitive, range: start.upperBound..<result.endIndex) {
+            result.removeSubrange(start.lowerBound..<end.upperBound)
+        }
+        if let end = result.range(of: "</think>", options: [.caseInsensitive, .backwards]) {
+            result = String(result[end.upperBound...])
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func isReasoningEvent(eventType: String?, json: [String: Any]) -> Bool {
@@ -416,6 +816,7 @@ actor LLMClient {
 
     private func withTimeout<T>(
         seconds: UInt64,
+        timeoutMessage: String? = nil,
         operation: @escaping () async throws -> T
     ) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
@@ -424,6 +825,9 @@ actor LLMClient {
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+                if let timeoutMessage {
+                    throw AppError.network(timeoutMessage)
+                }
                 let minutes = max(1, Int(ceil(Double(seconds) / 60.0)))
                 throw AppError.network("Codex 超过 \(minutes) 分钟仍未返回。可以中断任务，或在偏好设置里降低 Thinking 智能程度后重试。")
             }

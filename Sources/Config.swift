@@ -3,8 +3,25 @@ import Foundation
 import LocalAuthentication
 import Security
 
+enum LLMProvider: String, CaseIterable, Identifiable {
+    case codex
+    case openAICompatible
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .codex: return "ChatGPT / Codex"
+        case .openAICompatible: return "OpenAI 兼容 API"
+        }
+    }
+}
+
 struct AppConfig {
-    let codexCredentials: CodexOAuthCredentials
+    let provider: LLMProvider
+    let codexCredentials: CodexOAuthCredentials?
+    let customBaseURL: String
+    let customAPIKey: String
     let model: String
     let thinkingEnabled: Bool
     let reasoningEffort: ReasoningEffort
@@ -21,12 +38,57 @@ struct AppConfig {
     let instructions: String
     let maxImageEdge: Int
 
+    init(
+        provider: LLMProvider = .codex,
+        codexCredentials: CodexOAuthCredentials? = nil,
+        customBaseURL: String = "",
+        customAPIKey: String = "",
+        model: String,
+        thinkingEnabled: Bool,
+        reasoningEffort: ReasoningEffort,
+        reasoningSummary: ReasoningSummary,
+        textVerbosity: TextVerbosity,
+        serviceTier: ServiceTier,
+        maxOutputTokens: Int,
+        outputDisplayMode: OutputDisplayMode,
+        touchBarFontSize: Double,
+        touchBarTextColor: TouchBarTextColor,
+        touchBarTextIntensity: Double,
+        touchBarTextAlignment: TouchBarTextAlignment,
+        prompt: String,
+        instructions: String,
+        maxImageEdge: Int
+    ) {
+        self.provider = provider
+        self.codexCredentials = codexCredentials
+        self.customBaseURL = customBaseURL
+        self.customAPIKey = customAPIKey
+        self.model = model
+        self.thinkingEnabled = thinkingEnabled
+        self.reasoningEffort = reasoningEffort
+        self.reasoningSummary = reasoningSummary
+        self.textVerbosity = textVerbosity
+        self.serviceTier = serviceTier
+        self.maxOutputTokens = maxOutputTokens
+        self.outputDisplayMode = outputDisplayMode
+        self.touchBarFontSize = touchBarFontSize
+        self.touchBarTextColor = touchBarTextColor
+        self.touchBarTextIntensity = touchBarTextIntensity
+        self.touchBarTextAlignment = touchBarTextAlignment
+        self.prompt = prompt
+        self.instructions = instructions
+        self.maxImageEdge = maxImageEdge
+    }
+
     static func load() throws -> AppConfig {
         try ConfigDraft.load().makeConfig()
     }
 }
 
 struct ConfigDraft: Equatable {
+    var provider: LLMProvider
+    var customBaseURL: String
+    var customAPIKey: String
     var model: String
     var thinkingEnabled: Bool
     var reasoningEffort: ReasoningEffort
@@ -135,6 +197,17 @@ struct ConfigDraft: Equatable {
         }
 
         return ConfigDraft(
+            provider: LLMProvider(
+                rawValue: defaults.string(forKey: Keys.provider)
+                    ?? env["SCREEN_LLM_PROVIDER"]
+                    ?? LLMProvider.codex.rawValue
+            ) ?? .codex,
+            customBaseURL: defaults.string(forKey: Keys.customBaseURL)
+                ?? env["SCREEN_LLM_BASE_URL"]
+                ?? "",
+            customAPIKey: KeychainStore.readOpenAIAPIKey()
+                ?? env["SCREEN_LLM_API_KEY"]
+                ?? "",
             model: model
                 ?? env["SCREEN_LLM_MODEL"]
                 ?? defaultModel,
@@ -285,6 +358,9 @@ struct ConfigDraft: Equatable {
 
     func save() {
         let defaults = UserDefaults.standard
+        defaults.set(provider.rawValue, forKey: Keys.provider)
+        defaults.set(customBaseURL, forKey: Keys.customBaseURL)
+        KeychainStore.saveOpenAIAPIKeyAsync(customAPIKey)
         defaults.set(model, forKey: Keys.model)
         defaults.set(thinkingEnabled, forKey: Keys.thinkingEnabled)
         defaults.set(reasoningEffort.rawValue, forKey: Keys.reasoningEffort)
@@ -332,21 +408,32 @@ struct ConfigDraft: Equatable {
         try makeConfig(codexCredentials: KeychainStore.readCodexCredentials())
     }
 
-    func makeConfig(codexCredentials: CodexOAuthCredentials?) throws -> AppConfig {
-        guard let credentials = codexCredentials else {
-            throw AppError.configuration("请先登录 ChatGPT/Codex。")
-        }
-
+    func makeConfig(codexCredentials: CodexOAuthCredentials? = KeychainStore.readCodexCredentials()) throws -> AppConfig {
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedModel.isEmpty else {
             throw AppError.configuration("模型不能为空。")
         }
-        guard Self.isSupportedModel(trimmedModel) else {
-            throw AppError.configuration("模型输入有误。")
+
+        let trimmedBaseURL = customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch provider {
+        case .codex:
+            guard codexCredentials != nil else {
+                throw AppError.configuration("请先登录 ChatGPT/Codex。")
+            }
+            guard Self.isSupportedModel(trimmedModel) else {
+                throw AppError.configuration("模型输入有误。")
+            }
+        case .openAICompatible:
+            guard LLMClient.resolveOpenAICompatibleEndpoint(trimmedBaseURL) != nil else {
+                throw AppError.configuration("OpenAI 兼容 API 地址无效。")
+            }
         }
 
         return AppConfig(
-            codexCredentials: credentials,
+            provider: provider,
+            codexCredentials: codexCredentials,
+            customBaseURL: trimmedBaseURL,
+            customAPIKey: customAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
             model: trimmedModel,
             thinkingEnabled: thinkingEnabled,
             reasoningEffort: reasoningEffort,
@@ -583,6 +670,8 @@ enum ServiceTier: String, CaseIterable, Identifiable {
 }
 
 private enum Keys {
+    static let provider = "catGPT.provider"
+    static let customBaseURL = "catGPT.customBaseURL"
     static let model = "catGPT.model"
     static let thinkingEnabled = "catGPT.thinkingEnabled"
     static let reasoningEffort = "catGPT.reasoningEffort"
@@ -657,6 +746,7 @@ enum PromptPresetStore {
 enum KeychainStore {
     private static let service = "CatGPT"
     private static let codexAccount = "CODEX_OAUTH_CREDENTIALS"
+    private static let openAIAPIKeyAccount = "OPENAI_COMPATIBLE_API_KEY"
     /// 所有异步写操作走同一条串行队列，保证"登出删除"和"刷新保存"
     /// 按发起顺序落盘，不会出现登出后旧的保存任务把凭证写回去。
     private static let writeQueue = DispatchQueue(label: "CatGPT.KeychainStore")
@@ -670,6 +760,20 @@ enum KeychainStore {
     static func deleteCodexCredentialsAsync() {
         writeQueue.async {
             deleteCodexCredentials()
+        }
+    }
+
+    static func readOpenAIAPIKey() -> String? {
+        readString(account: openAIAPIKeyAccount)
+    }
+
+    static func saveOpenAIAPIKeyAsync(_ apiKey: String) {
+        writeQueue.async {
+            if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                deleteString(account: openAIAPIKeyAccount)
+            } else {
+                try? saveString(apiKey, account: openAIAPIKeyAccount)
+            }
         }
     }
 
@@ -690,10 +794,14 @@ enum KeychainStore {
     }
 
     static func deleteCodexCredentials() {
+        deleteString(account: codexAccount)
+    }
+
+    private static func deleteString(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: codexAccount
+            kSecAttrAccount as String: account
         ]
         // errSecItemNotFound 视为已删除，无需报错。
         SecItemDelete(query as CFDictionary)

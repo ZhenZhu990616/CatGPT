@@ -4,7 +4,7 @@
 
 # CatGPT
 
-一个只使用 ChatGPT/Codex OAuth 的 macOS 菜单栏工具。设置界面是原生 macOS 窗口，不再启动 localhost Web 前端。
+一个支持 ChatGPT/Codex OAuth 和自定义 OpenAI 兼容 API 的 macOS 菜单栏工具。设置界面是原生 macOS 窗口，不再启动 localhost Web 前端。
 
 ## 运行
 
@@ -23,7 +23,7 @@ swift run CatGPT
 - 呼出/隐藏浮窗
 - 历史记录（最近 50 条问答，点击可回看）
 - 提示词预设（内置通用分析 / OCR 提取文字 / 翻译，可在设置中自定义）
-- 登录 ChatGPT / 退出登录
+- 登录 ChatGPT / 退出登录（使用 ChatGPT/Codex 服务时显示）
 - 请求屏幕权限
 - 退出
 
@@ -57,6 +57,26 @@ ScreenCaptureKit 截屏（自动排除自家窗口、保留 Retina 分辨率）�
 | `SCREEN_LLM_MAX_IMAGE_EDGE` | `1600` |
 
 登录凭证保存在 macOS 钥匙串。首次截图需要给启动程序的终端或可执行文件授予屏幕录制权限。
+
+### 自定义 OpenAI 兼容 API
+
+打开“偏好设置”中的“模型”页，将“接口类型”切换为“OpenAI 兼容 API”；然后在“服务”页填写：
+
+- **API 地址**：服务根地址，例如 `https://api.openai.com/v1`。应用会自动请求其 `/chat/completions` 路径，也可以直接填写完整路径。
+- **API Key**：可选。非空值保存在 macOS 钥匙串，并通过 `Authorization: Bearer ...` 发送；本地服务可以留空。
+- **模型 ID**：填写服务实际支持的模型 ID。外部模式不会限制为内置 Codex 模型列表。
+
+外部服务需要支持 OpenAI Chat Completions 协议的视觉输入格式：请求中的截图以 `image_url` data URL 发送。应用支持流式 SSE 返回，也兼容普通 JSON 返回。
+
+也可以通过环境变量初始化外部服务配置：
+
+| 变量 | 说明 |
+| --- | --- |
+| `SCREEN_LLM_PROVIDER` | 设置为 `openAICompatible` 以启用外部 API |
+| `SCREEN_LLM_BASE_URL` | 外部服务根地址或完整 `/chat/completions` 地址 |
+| `SCREEN_LLM_API_KEY` | API Key；仅作为无钥匙串配置时的初始化回退值 |
+
+应用设置保存后优先使用本机已保存的配置；API Key 不写入 `UserDefaults`。
 
 ### 批量截图
 

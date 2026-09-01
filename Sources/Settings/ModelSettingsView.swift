@@ -6,11 +6,28 @@ struct ModelSettingsView: View {
     var body: some View {
         SettingsPage(
             title: "模型",
-            subtitle: "配置 Codex 模型、推理强度与回答输出。"
+            subtitle: "配置服务模型、推理强度与回答输出。"
         ) {
             VStack(spacing: 24) {
+                SettingsGroup("服务") {
+                    SettingsRow("接口类型", subtitle: "选择内置 ChatGPT/Codex，或使用任意 OpenAI 兼容服务") {
+                        SettingsMenuPicker(
+                            selection: model.binding(\ConfigDraft.provider, scope: .client),
+                            options: LLMProvider.allCases,
+                            title: \.title,
+                            accessibilityLabel: "接口类型"
+                        )
+                        .frame(width: 190)
+                    }
+
+                }
                 SettingsGroup("模型") {
-                    SettingsRow("模型 ID", subtitle: "发送给 Codex Responses 的 model 字段") {
+                    SettingsRow(
+                        "模型 ID",
+                        subtitle: model.draft.provider == .codex
+                            ? "发送给 Codex Responses 的 model 字段"
+                            : "发送给 /chat/completions 的 model 字段"
+                    ) {
                         TextField("模型 ID", text: model.textBinding(\ConfigDraft.model, field: .model))
                             .textFieldStyle(.plain)
                             .padding(.horizontal, 9)

@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    private static let frameAutosaveName = "CatGPTSettings.0.3.0"
+    private static let frameAutosaveName = "CatGPTSettings.0.4.0"
     private let model: SettingsViewModel
 
     init(
@@ -13,7 +13,8 @@ final class SettingsWindowController: NSWindowController {
         onLogin: @escaping () -> Void,
         onLogout: @escaping () -> Void,
         onPermission: @escaping () -> Void,
-        onAccessibilityPermission: @escaping () -> Void = {}
+        onAccessibilityPermission: @escaping () -> Void = {},
+        onVerifyExternalService: @escaping (ConfigDraft) async throws -> Void = { _ in }
     ) {
         model = SettingsViewModel(
             initialDraft: draftProvider(),
@@ -23,7 +24,8 @@ final class SettingsWindowController: NSWindowController {
             onLogin: onLogin,
             onLogout: onLogout,
             onPermission: onPermission,
-            onAccessibilityPermission: onAccessibilityPermission
+            onAccessibilityPermission: onAccessibilityPermission,
+            onVerifyExternalService: onVerifyExternalService
         )
 
         let defaultContentSize = NSSize(width: 800, height: 580)

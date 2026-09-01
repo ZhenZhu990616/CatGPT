@@ -29,7 +29,10 @@ enum SettingsUpdateScope: Hashable {
             result.insert(.shortcuts)
         }
 
-        if old.model != new.model
+        if old.provider != new.provider
+            || old.customBaseURL != new.customBaseURL
+            || old.customAPIKey != new.customAPIKey
+            || old.model != new.model
             || old.thinkingEnabled != new.thinkingEnabled
             || old.reasoningEffort != new.reasoningEffort
             || old.reasoningSummary != new.reasoningSummary

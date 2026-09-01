@@ -104,6 +104,111 @@ final class OAuthAndLLMClientTests: XCTestCase {
         XCTAssertEqual(recorder.events, [.connected, .reasoning, .delta("Hel"), .delta("Hello")])
     }
 
+    func testLLMClientUsesOpenAICompatibleStreamingWithoutCodexCredentials() async throws {
+        let recorder = EventRecorder()
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .stream(events: [
+                    #"data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#,
+                    #"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+                    #"data: {"choices":[{"delta":{"content":"!"}}]}"#,
+                    "data: [DONE]"
+                ])
+            ])
+        )
+
+        let result = try await client.analyze(imageData: Data([0x01])) { recorder.record($0) }
+
+        XCTAssertEqual(result, "Hello!")
+        XCTAssertEqual(recorder.events, [.connected, .reasoning, .delta("Hello"), .delta("Hello!")])
+    }
+
+    func testLLMClientAcceptsOpenAICompatibleJSONResponse() async throws {
+        let recorder = EventRecorder()
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .http(
+                    statusCode: 200,
+                    body: #"{"choices":[{"message":{"content":"JSON answer"}}]}"#
+                )
+            ])
+        )
+
+        let result = try await client.analyze(imageData: Data([0x01])) { recorder.record($0) }
+
+        XCTAssertEqual(result, "JSON answer")
+        XCTAssertEqual(recorder.events, [.connected, .delta("JSON answer")])
+    }
+
+    func testLLMClientAcceptsJSONWhenGatewayLabelsResponseAsSSE() async throws {
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .http(
+                    statusCode: 200,
+                    body: #"{"choices":[{"message":{"content":"JSON answer"}}]}"#,
+                    contentType: "text/event-stream"
+                )
+            ])
+        )
+
+        let result = try await client.analyze(imageData: Data([0x01]))
+
+        XCTAssertEqual(result, "JSON answer")
+    }
+
+    func testLLMClientAcceptsContentPartArrayResponse() async throws {
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .http(
+                    statusCode: 200,
+                    body: #"{"choices":[{"message":{"content":[{"type":"text","text":"part one "},{"type":"text","text":"part two"}]}}]}"#
+                )
+            ])
+        )
+
+        let result = try await client.analyze(imageData: Data([0x01]))
+
+        XCTAssertEqual(result, "part one part two")
+    }
+
+    func testOpenAICompatibleVerificationUsesNonStreamingRequestAndBearerKey() async throws {
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .http(statusCode: 200, body: #"{"choices":[{"message":{"content":"OK"}}]}"#)
+            ])
+        )
+
+        try await client.verifyConnection()
+
+        let request = try XCTUnwrap(StubURLProtocol.requests.first)
+        XCTAssertEqual(request.url?.absoluteString, "https://example.com/v1/chat/completions")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer key")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+
+    }
+
+    func testOpenAICompatibleVerificationSurfacesHTTPError() async throws {
+        let client = LLMClient(
+            config: makeConfig(provider: .openAICompatible),
+            session: makeSession(responses: [
+                .http(statusCode: 401, body: #"{"error":{"message":"invalid api key"}}"#)
+            ])
+        )
+
+        do {
+            try await client.verifyConnection()
+            XCTFail("expected verification error")
+        } catch let error as AppError {
+            XCTAssertAppError(error, equals: .response("外部 LLM 返回错误：invalid api key"))
+        }
+    }
+
     func testLLMClientThrowsWhenStreamEndsWithoutText() async throws {
         let client = LLMClient(
             config: makeConfig(),
@@ -146,9 +251,14 @@ final class OAuthAndLLMClientTests: XCTestCase {
         }
     }
 
-    private func makeConfig() -> AppConfig {
+    private func makeConfig(provider: LLMProvider = .codex) -> AppConfig {
         AppConfig(
-            codexCredentials: CodexOAuthCredentials(access: "access", refresh: "refresh", expires: 9_999_999_999, accountId: "account"),
+            provider: provider,
+            codexCredentials: provider == .codex
+                ? CodexOAuthCredentials(access: "access", refresh: "refresh", expires: 9_999_999_999, accountId: "account")
+                : nil,
+            customBaseURL: "https://example.com/v1",
+            customAPIKey: "key",
             model: "gpt-5.6-terra", thinkingEnabled: true, reasoningEffort: .medium,
             reasoningSummary: .none, textVerbosity: .low, serviceTier: .systemDefault,
             maxOutputTokens: 0, outputDisplayMode: .floatingPanel, touchBarFontSize: 14,
@@ -162,6 +272,7 @@ final class OAuthAndLLMClientTests: XCTestCase {
         configuration.protocolClasses = [StubURLProtocol.self]
         StubURLProtocol.responses = responses
         StubURLProtocol.requestCount = 0
+        StubURLProtocol.requests = []
         return URLSession(configuration: configuration)
     }
 
@@ -222,14 +333,14 @@ private final class LockedCounter: @unchecked Sendable {
 private final class StubURLProtocol: URLProtocol {
     struct Response {
         enum Kind {
-            case http(statusCode: Int, body: String)
+            case http(statusCode: Int, body: String, contentType: String)
             case stream(events: [String])
         }
 
         let kind: Kind
 
-        static func http(statusCode: Int, body: String) -> Self {
-            Self(kind: .http(statusCode: statusCode, body: body))
+        static func http(statusCode: Int, body: String, contentType: String = "application/json") -> Self {
+            Self(kind: .http(statusCode: statusCode, body: body, contentType: contentType))
         }
 
         static func stream(events: [String]) -> Self {
@@ -239,6 +350,7 @@ private final class StubURLProtocol: URLProtocol {
 
     static var responses: [Response] = []
     static var requestCount = 0
+    static var requests: [URLRequest] = []
     private static let lock = NSLock()
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -257,16 +369,17 @@ private final class StubURLProtocol: URLProtocol {
             return
         }
         Self.requestCount += 1
+        Self.requests.append(request)
         let response = Self.responses.removeFirst()
         Self.lock.unlock()
 
         switch response.kind {
-        case .http(let statusCode, let body):
+        case .http(let statusCode, let body, let contentType):
             let httpResponse = HTTPURLResponse(
                 url: request.url ?? URL(string: "https://example.com")!,
                 statusCode: statusCode,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": "application/json"]
+                headerFields: ["Content-Type": contentType]
             )!
             client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: Data(body.utf8))

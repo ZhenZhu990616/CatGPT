@@ -39,9 +39,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.3.0</string>
+  <string>0.4.0</string>
   <key>CFBundleVersion</key>
-  <string>3</string>
+  <string>4</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
@@ -49,7 +49,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>用于在用户按下快捷键或点击截图按钮时截取屏幕并发送给 Codex 分析。</string>
+  <string>用于在用户按下快捷键或点击截图按钮时截取屏幕并发送给配置的 LLM 服务分析。</string>
 </dict>
 </plist>
 PLIST

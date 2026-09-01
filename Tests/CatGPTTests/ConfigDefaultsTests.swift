@@ -126,4 +126,20 @@ final class ConfigDefaultsTests: XCTestCase {
             XCTAssertEqual(error.localizedDescription, "模型输入有误。")
         }
     }
+
+    func testOpenAICompatibleConfigurationDoesNotRequireCodexCredentials() throws {
+        var draft = ConfigDraft.load()
+        draft.provider = .openAICompatible
+        draft.customBaseURL = "https://example.com/v1"
+        draft.customAPIKey = "test-key"
+        draft.model = "local-vision-model"
+
+        let config = try draft.makeConfig(codexCredentials: nil)
+
+        XCTAssertEqual(config.provider, .openAICompatible)
+        XCTAssertNil(config.codexCredentials)
+        XCTAssertEqual(config.customBaseURL, "https://example.com/v1")
+        XCTAssertEqual(config.customAPIKey, "test-key")
+        XCTAssertEqual(config.model, "local-vision-model")
+    }
 }

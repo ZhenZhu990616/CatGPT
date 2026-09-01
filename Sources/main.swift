@@ -206,7 +206,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         return true
     }
 
-    private func updateAccountMenuItems() {
+    private func updateAccountMenuItems(provider: LLMProvider? = nil) {
+        let isCodex = (provider ?? draft.provider) == .codex
+        loginMenuItem?.isHidden = !isCodex
+        logoutMenuItem?.isHidden = !isCodex
         loginMenuItem?.title = credentials == nil ? "登录 ChatGPT" : "重新登录 ChatGPT"
     }
 
@@ -319,6 +322,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     private func rebuildClient(from candidate: ConfigDraft) {
+        // applyDraftFromSettings 在 SettingsApplication 内以 inout 修改 draft；
+        // 这里必须使用 candidate，避免同时读取 AppDelegate.draft 触发独占访问冲突。
+        updateAccountMenuItems(provider: candidate.provider)
         let generation = clientGeneration
         let config: AppConfig
         do {
@@ -327,10 +333,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             client = nil
             if credentialsLoaded {
                 // 区分"缺凭证"和"配置非法（如模型清空）"，别一律误报"请先登录"。
-                if case AppError.configuration = error, credentials != nil {
+                if case AppError.configuration = error {
                     setStatus(error.localizedDescription, kind: "warning")
                 } else {
-                    setStatus("请先登录 ChatGPT/Codex", kind: "warning")
+                    setStatus(candidate.provider == .codex ? "请先登录 ChatGPT/Codex" : "请先配置外部 LLM", kind: "warning")
                 }
             } else {
                 setStatus("正在读取登录状态...", kind: "working")
@@ -346,7 +352,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 KeychainStore.saveCodexCredentialsAsync(credentials)
             }
         }
-        setStatus("已登录，可截图", kind: "ready")
+        setStatus(
+            candidate.provider == .codex ? "已登录，可截图" : "外部 LLM 已配置，可截图",
+            kind: "ready"
+        )
     }
 
     private func loadStoredCredentials() {
@@ -505,7 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return
         }
         guard client != nil else {
-            throw AppError.configuration("请先登录 ChatGPT/Codex。")
+            throw AppError.configuration(configurationRequiredMessage)
         }
         guard Screenshotter.hasPermission() else {
             Screenshotter.requestPermissionIfNeeded()
@@ -513,7 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         guard case .images(let images) = batchCaptureQueue.takeAllForSending() else { return }
 
-        try startRequestState(status: "正在发送到 Codex...", phase: "sending")
+        try startRequestState(status: "正在发送到 \(providerDisplayName)...", phase: "sending")
         batchProgressUsesFloatingPanel = true
         syncBatchEscapeMonitor()
         touchBarResult.hideForCapture()
@@ -552,7 +561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private func startRequestState(status: String, phase: String) throws {
         guard client != nil else {
-            throw AppError.configuration("请先登录 ChatGPT/Codex。")
+            throw AppError.configuration(configurationRequiredMessage)
         }
         isRunning = true
         streamTextCoalescer.cancel()
@@ -564,7 +573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @MainActor
     private func performBatchAnalysis(images: [Data], token: UUID) async throws -> String {
         guard let client else {
-            throw AppError.configuration("请先登录 ChatGPT/Codex。")
+            throw AppError.configuration(configurationRequiredMessage)
         }
         let answer = try await client.analyze(
             imageDataList: images,
@@ -726,7 +735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             if captureToken == token {
                 isRunning = false
             }
-            throw AppError.configuration("请先登录 ChatGPT/Codex。")
+            throw AppError.configuration(configurationRequiredMessage)
         }
 
         // 权限前置检查：别让用户拖完整个框选才发现没有屏幕录制权限。
@@ -748,7 +757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 throw CancellationError()
             }
 
-            setStatus("正在发送到 Codex...", kind: "working", phase: "sending")
+            setStatus("正在发送到 \(providerDisplayName)...", kind: "working", phase: "sending")
             showOutputPhase("sending")
 
             // 阶段切换由真实 SSE 事件驱动；正文随 delta 增量上屏。
@@ -788,7 +797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 guard let self, self.isRunning, self.captureToken == token else { return }
                 switch event {
                 case .connected:
-                    self.setStatus("正在接收 Codex 返回...", kind: "working", phase: "receiving")
+                    self.setStatus("正在接收 \(self.providerDisplayName) 返回...", kind: "working", phase: "receiving")
                     self.showOutputPhase("receiving")
                 case .reasoning:
                     self.setStatus("正在思考...", kind: "working", phase: "thinking")
@@ -808,6 +817,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// 否则回答会送到不存在的 Touch Bar 上、用户什么也看不到。
     private var usingTouchBar: Bool {
         draft.outputDisplayMode == .touchBar && TouchBarResultController.isAvailable
+    }
+
+    private var providerDisplayName: String {
+        draft.provider == .codex ? "Codex" : "外部 LLM"
+    }
+
+    private var configurationRequiredMessage: String {
+        draft.provider == .codex ? "请先登录 ChatGPT/Codex。" : "请先在模型设置中填写有效的 OpenAI 兼容 API 地址和模型。"
     }
 
     private func showOutput(text: String, kind: String, autoScroll: Bool = false, isStreaming: Bool = false) {
@@ -891,7 +908,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 onLogin: { [weak self] in self?.startLoginFromSettings() },
                 onLogout: { [weak self] in self?.logout() },
                 onPermission: { [weak self] in self?.requestScreenPermission() },
-                onAccessibilityPermission: { [weak self] in self?.requestAccessibilityPermission() }
+                onAccessibilityPermission: { [weak self] in self?.requestAccessibilityPermission() },
+                onVerifyExternalService: { [weak self] candidate in
+                    guard let self else { return }
+                    let config = try candidate.makeConfig(codexCredentials: self.credentials)
+                    guard config.provider == .openAICompatible else {
+                        throw AppError.configuration("当前不是 OpenAI 兼容 API。")
+                    }
+                    try await LLMClient(config: config).verifyConnection()
+                }
             )
         }
         settingsWindowController?.showWindow(nil)
