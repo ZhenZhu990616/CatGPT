@@ -94,9 +94,44 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(model.draft.maxOutputTokens, 0)
     }
 
+    func testExternalVerificationSucceedsAndPublishesResult() async throws {
+        var initial = ConfigDraft.load()
+        initial.provider = .openAICompatible
+        initial.customBaseURL = "https://example.com/v1"
+        initial.model = "test-model"
+        let verified = expectation(description: "verification callback")
+        let model = makeModel(initial: initial, verify: { _ in verified.fulfill() }) { _, _ in }
+
+        model.verifyExternalServiceConnection()
+        await fulfillment(of: [verified], timeout: 1)
+
+        for _ in 0..<100 {
+            if model.externalServiceVerificationSucceeded { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(model.externalServiceVerificationSucceeded)
+        XCTAssertEqual(model.externalServiceVerificationMessage, "连接成功")
+        XCTAssertFalse(model.isVerifyingExternalService)
+    }
+
+    func testExternalVerificationRejectsMissingAddressWithoutCallingService() {
+        var initial = ConfigDraft.load()
+        initial.provider = .openAICompatible
+        initial.customBaseURL = ""
+        var callbackCount = 0
+        let model = makeModel(initial: initial, verify: { _ in callbackCount += 1 }) { _, _ in }
+
+        model.verifyExternalServiceConnection()
+
+        XCTAssertEqual(callbackCount, 0)
+        XCTAssertEqual(model.externalServiceVerificationMessage, "API 地址不能为空。")
+        XCTAssertFalse(model.externalServiceVerificationSucceeded)
+    }
+
     private func makeModel(
         initial: ConfigDraft,
         debounceNanoseconds: UInt64 = 300_000_000,
+        verify: @escaping (ConfigDraft) async throws -> Void = { _ in },
         apply: @escaping (ConfigDraft, SettingsUpdateScope) throws -> Void
     ) -> SettingsViewModel {
         SettingsViewModel(
@@ -111,6 +146,7 @@ final class SettingsViewModelTests: XCTestCase {
                 )
             },
             applyDraft: apply,
+            onVerifyExternalService: verify,
             debounceNanoseconds: debounceNanoseconds
         )
     }

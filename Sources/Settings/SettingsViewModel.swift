@@ -29,6 +29,8 @@ struct SettingsState: Equatable {
 }
 
 enum SettingsField: Hashable {
+    case customBaseURL
+    case customAPIKey
     case model
     case prompt
     case instructions
@@ -50,6 +52,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var newPresetName = ""
     @Published private(set) var launchAtLogin: Bool
     @Published private(set) var launchAtLoginError: String?
+    @Published private(set) var isVerifyingExternalService = false
+    @Published private(set) var externalServiceVerificationMessage: String?
+    @Published private(set) var externalServiceVerificationSucceeded = false
 
     let launchAtLoginAvailable = Bundle.main.bundlePath.hasSuffix(".app")
 
@@ -60,8 +65,11 @@ final class SettingsViewModel: ObservableObject {
     private let onLogout: () -> Void
     private let onPermission: () -> Void
     private let onAccessibilityPermission: () -> Void
+    private let onVerifyExternalService: (ConfigDraft) async throws -> Void
     private let debounceNanoseconds: UInt64
     private var pendingTextTasks: [SettingsField: Task<Void, Never>] = [:]
+    private var externalVerificationTask: Task<Void, Never>?
+    private var externalVerificationRevision = 0
 
     init(
         initialDraft: ConfigDraft,
@@ -72,6 +80,7 @@ final class SettingsViewModel: ObservableObject {
         onLogout: @escaping () -> Void = {},
         onPermission: @escaping () -> Void = {},
         onAccessibilityPermission: @escaping () -> Void = {},
+        onVerifyExternalService: @escaping (ConfigDraft) async throws -> Void = { _ in },
         debounceNanoseconds: UInt64 = 300_000_000
     ) {
         draft = initialDraft
@@ -83,6 +92,7 @@ final class SettingsViewModel: ObservableObject {
         self.onLogout = onLogout
         self.onPermission = onPermission
         self.onAccessibilityPermission = onAccessibilityPermission
+        self.onVerifyExternalService = onVerifyExternalService
         self.debounceNanoseconds = debounceNanoseconds
         state = stateProvider()
         presets = PromptPresetStore.load()
@@ -116,6 +126,9 @@ final class SettingsViewModel: ObservableObject {
     ) {
         guard draft[keyPath: keyPath] != value else { return }
 
+        if scope == .client {
+            invalidateExternalServiceVerification()
+        }
         draft[keyPath: keyPath] = value
         var candidate = lastAppliedDraft
         candidate[keyPath: keyPath] = value
@@ -143,6 +156,9 @@ final class SettingsViewModel: ObservableObject {
         at keyPath: WritableKeyPath<ConfigDraft, String>,
         field: SettingsField
     ) {
+        if [.customBaseURL, .customAPIKey, .model].contains(field) {
+            invalidateExternalServiceVerification()
+        }
         draft[keyPath: keyPath] = value
         fieldErrors[field] = nil
         pendingTextTasks[field]?.cancel()
@@ -228,6 +244,61 @@ final class SettingsViewModel: ObservableObject {
 
     func setMaxOutputTokens(_ value: Int) {
         set(max(0, value), at: \ConfigDraft.maxOutputTokens, scope: .client)
+    }
+
+    func verifyExternalServiceConnection() {
+        guard !isVerifyingExternalService else { return }
+
+        guard draft.provider == .openAICompatible else {
+            setExternalVerificationFailure("当前不是 OpenAI 兼容 API。")
+            return
+        }
+        guard !draft.customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            setExternalVerificationFailure("API 地址不能为空。")
+            return
+        }
+        guard !draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            setExternalVerificationFailure("模型不能为空。")
+            return
+        }
+
+        externalVerificationRevision += 1
+        let revision = externalVerificationRevision
+        let candidate = draft
+        isVerifyingExternalService = true
+        externalServiceVerificationMessage = "正在验证…"
+        externalServiceVerificationSucceeded = false
+
+        externalVerificationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.externalVerificationRevision == revision {
+                    self.externalVerificationTask = nil
+                }
+            }
+
+            do {
+                try await self.onVerifyExternalService(candidate)
+                guard !Task.isCancelled, self.externalVerificationRevision == revision else { return }
+                self.isVerifyingExternalService = false
+                self.externalServiceVerificationMessage = "连接成功"
+                self.externalServiceVerificationSucceeded = true
+            } catch {
+                guard !Task.isCancelled, self.externalVerificationRevision == revision else { return }
+                self.isVerifyingExternalService = false
+                self.externalServiceVerificationMessage = error.localizedDescription
+                self.externalServiceVerificationSucceeded = false
+            }
+        }
+    }
+
+    var externalServiceStatusText: String {
+        if isVerifyingExternalService { return "正在验证…" }
+        if let message = externalServiceVerificationMessage { return message }
+        if draft.customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "尚未填写 API 地址"
+        }
+        return "使用自定义 OpenAI 兼容服务"
     }
 
     func setMaxImageEdge(_ value: Int) {
@@ -340,8 +411,14 @@ final class SettingsViewModel: ObservableObject {
             fieldErrors[field] = "模型不能为空。"
             return
         }
-        if field == .model && !ConfigDraft.isSupportedModel(value) {
+        if field == .model,
+           draft.provider == .codex,
+           !ConfigDraft.isSupportedModel(value) {
             fieldErrors[field] = "模型输入有误。"
+            return
+        }
+        if field == .customBaseURL && value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fieldErrors[field] = "API 地址不能为空。"
             return
         }
 
@@ -358,6 +435,24 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             fieldErrors[field] = error.localizedDescription
         }
+    }
+
+    private func invalidateExternalServiceVerification() {
+        externalVerificationRevision += 1
+        externalVerificationTask?.cancel()
+        externalVerificationTask = nil
+        isVerifyingExternalService = false
+        externalServiceVerificationMessage = nil
+        externalServiceVerificationSucceeded = false
+    }
+
+    private func setExternalVerificationFailure(_ message: String) {
+        externalVerificationRevision += 1
+        externalVerificationTask?.cancel()
+        externalVerificationTask = nil
+        isVerifyingExternalService = false
+        externalServiceVerificationMessage = message
+        externalServiceVerificationSucceeded = false
     }
 }
 
